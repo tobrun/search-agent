@@ -100,33 +100,60 @@ search_tool = GoogleSerperAPIWrapper()
 def query_assessment(state: SearchState) -> Dict:
     """Assess the query to determine the appropriate search strategy."""
     query = state["query"]
+    blacklist = state.get("blacklist", [])
 
     log_step("QUERY_ASSESSMENT", f"Assessing query: '{query}'")
 
     prompt = f"""
-    Analyze the following query and determine the most appropriate search strategy:
+    You are a query classification expert with deep knowledge of information retrieval systems.
 
-    Query: {query}
+    TASK: Analyze this query and determine the optimal search strategy.
 
-    Determine if this query:
-    1. Can be answered directly from your knowledge (DIRECT)
-    2. Requires a simple search for real-time or specific information (SIMPLE_SEARCH)
-    3. Requires deep research with multiple searches and information aggregation (DEEP_RESEARCH)
+    QUERY: "{query}"
 
-    Respond only with: DIRECT, SIMPLE_SEARCH, or DEEP_RESEARCH
+    CONTEXT FACTORS:
+    - Your current knowledge cutoff is October 2024
+    - Technical, scientific, or academic queries often benefit from deep research
+    - Current events, statistics, or specific facts typically require search verification
+    - General knowledge, concepts, or explanations may be answerable directly
+    {f"- The following domains are blacklisted: {', '.join(blacklist)}" if blacklist else ""}
+
+    CLASSIFICATION OPTIONS:
+
+    1. DIRECT: Query can be answered comprehensively from your knowledge base without external search.
+       Examples: "Explain photosynthesis", "How does inflation work?", "What is the theory of relativity?"
+
+    2. SIMPLE_SEARCH: Query requires verification or specific information that can be found with a single targeted search.
+       Examples: "Who won the Super Bowl in 2024?", "What is the population of Tokyo?", "Latest iPhone release date"
+
+    3. DEEP_RESEARCH: Query requires comprehensive research with multiple searches and information synthesis.
+       Examples: "Compare current approaches to quantum computing", "What are the economic impacts of climate change policies?", "How has artificial intelligence changed medical diagnostics?"
+
+    Respond ONLY with one of these three classifications: DIRECT, SIMPLE_SEARCH, or DEEP_RESEARCH
     """
 
     messages = [HumanMessage(content=prompt)]
     response = llm.invoke(messages)
     query_type = response.content.strip()
 
+    # Extract just the classification label if there's additional text
+    if "DIRECT" in query_type:
+        query_type = "DIRECT"
+    elif "SIMPLE_SEARCH" in query_type:
+        query_type = "SIMPLE_SEARCH"
+    elif "DEEP_RESEARCH" in query_type:
+        query_type = "DEEP_RESEARCH"
+
     log_step("QUERY_ASSESSMENT", f"Query classified as: {query_type}")
+
+    # Determine max attempts based on query type
+    max_attempts = 2 if query_type == "DIRECT" else (3 if query_type == "SIMPLE_SEARCH" else 4)
 
     # Return updates to state
     return {
         "query_type": query_type,
         "attempts": 0,
-        "max_attempts": 3,  # Default max attempts
+        "max_attempts": max_attempts,  # Adaptive max attempts based on query type
         "messages": [
             {"role": "system", "content": "Query assessment complete."},
             {"role": "user", "content": prompt},
@@ -626,31 +653,50 @@ def verification(state: SearchState) -> Dict:
     final_answer = state["final_answer"]
     query_type = state["query_type"]
     attempts = state["attempts"]
+    sources = state.get("sources", [])
 
     log_step("VERIFICATION", f"Iteration {attempts}: Verifying answer for '{query}'")
 
+    # Extract source information for verification
+    source_info = ""
+    if sources:
+        top_sources = sources[:5] if len(sources) > 5 else sources
+        source_info = "Sources used:\n" + "\n".join([
+            f"- {s.get('title', 'Untitled')} ({s['url']})" for s in top_sources
+        ])
+
     prompt = f"""
-    Verify the correctness and completeness of this answer to: "{query}"
+    You are a fact-checking expert tasked with verifying an answer's accuracy and completeness.
 
-    Answer: {final_answer}
+    QUERY: "{query}"
 
-    Query type: {query_type}
+    ANSWER TO VERIFY: {final_answer}
 
-    Evaluate the answer based on:
-    - Accuracy: Is the information correct?
-    - Completeness: Does it fully address the query?
-    - Relevance: Is it directly addressing what was asked?
-    - Clarity: Is it clear and well-presented?
+    QUERY TYPE: {query_type}
 
-    Assign a confidence score from 0.0 to 1.0, where:
+    {source_info}
+
+    VERIFICATION CRITERIA:
+    1. Accuracy (40%): Are all stated facts correct? Are there any errors or misrepresentations?
+    2. Completeness (30%): Does the answer fully address all aspects of the query?
+    3. Relevance (20%): Is the answer directly addressing what was asked without unnecessary tangents?
+    4. Clarity (10%): Is the information presented in a clear, well-structured manner?
+
+    For each criterion, assign a sub-score from 0.0-1.0, then calculate a weighted final score.
+
+    Confidence score ranges:
     - 0.0-0.3: Low confidence (insufficient or potentially incorrect information)
     - 0.4-0.7: Medium confidence (generally correct but may have gaps or uncertainties)
     - 0.8-1.0: High confidence (comprehensive and accurate)
 
-    Respond in the following format:
-    SCORE: [confidence score between 0.0-1.0]
+    Respond in the following structured format:
+    ACCURACY_SCORE: [score] - [brief justification]
+    COMPLETENESS_SCORE: [score] - [brief justification]
+    RELEVANCE_SCORE: [score] - [brief justification]
+    CLARITY_SCORE: [score] - [brief justification]
+    FINAL_SCORE: [weighted average]
     STATUS: [VERIFIED or NEEDS_IMPROVEMENT]
-    FEEDBACK: [your feedback on the answer, if any]
+    FEEDBACK: [specific improvements needed or confirmation of quality]
     """
 
     messages = [HumanMessage(content=prompt)]
@@ -727,29 +773,50 @@ def summarize_answer(state: SearchState) -> Dict:
         log_step("FINAL_ANSWER", f"Top sources for attribution: {len(top_sources)}",
                  [f"{s.get('title', 'Untitled')} - {s['url']}" for s in top_sources])
 
+    # Determine response style based on query type and confidence
+    response_style = "academic" if query_type == "DEEP_RESEARCH" else "concise"
+    if confidence_score < 0.4:
+        response_style = "cautious"
+
     prompt = f"""
-    Refine and summarize the final answer to: "{query}"
+    You are an expert knowledge synthesizer tasked with creating a final answer for: "{query}"
 
-    Current answer: {final_answer}
+    CURRENT ANSWER: {final_answer}
 
-    Query type: {query_type}
+    QUERY TYPE: {query_type}
 
-    {"Verification feedback: " + verification_feedback if verification_feedback else ""}
+    VERIFICATION FEEDBACK: {verification_feedback if verification_feedback else "No specific feedback provided."}
 
-    Confidence score: {confidence_score:.2f}
+    CONFIDENCE SCORE: {confidence_score:.2f}
 
-    Sources to attribute (include these in your answer):
+    RESPONSE STYLE: {response_style}
+
+    SOURCES TO ATTRIBUTE:
     {json.dumps(top_sources, indent=2) if top_sources else "No specific sources to attribute."}
 
-    Create a polished, comprehensive response that:
-    - Directly addresses the query
-    - Is well-structured and clear
-    - Provides all relevant information
-    - Maintains an appropriate level of detail
-    - Uses a professional and helpful tone
-    - Includes appropriate source attribution at the end of the answer
+    GUIDELINES:
 
-    If the confidence score is less than 0.7, acknowledge any limitations or uncertainties in the answer.
+    1. Structure:
+       - Begin with a direct answer to the query
+       - Follow with supporting details and context
+       - End with source attribution
+
+    2. Style Adaptation:
+       - For "concise" style: Clear, straightforward language with minimal technical jargon
+       - For "academic" style: More detailed, authoritative tone with relevant terminology
+       - For "cautious" style: Acknowledge limitations clearly, use qualifying language
+
+    3. Confidence Handling:
+       - High confidence (>0.7): Present information with certainty
+       - Medium confidence (0.4-0.7): Acknowledge some limitations or areas of uncertainty
+       - Low confidence (<0.4): Clearly state limitations and present information as possibilities
+
+    4. Source Attribution:
+       - Include a "Sources:" section at the end
+       - Format each source as: "Source Name: URL"
+       - Prioritize credible, primary sources
+
+    Create a polished, comprehensive response that maintains an appropriate level of detail and tone based on the confidence score and query type.
     """
 
     messages = [HumanMessage(content=prompt)]
@@ -878,17 +945,22 @@ search_graph.add_edge("summarize_answer", END)
 compiled_search_graph = search_graph.compile()
 
 # Usage example
-def run_search_agent(query: str, blacklist=None):
+def run_search_agent(query: str, blacklist=None, debug_mode=False):
     """Run the search agent with a given query.
 
     Args:
         query (str): The search query to process
         blacklist (list, optional): List of domains to exclude from search results
+        debug_mode (bool, optional): Enable detailed debugging output
     """
+    # Create a session ID for tracking this search
+    session_id = f"search_{int(time.time())}"
+
     print(f"\n{'=' * 80}")
-    print(f"SEARCH QUERY: {query}")
+    print(f"🔍 SEARCH SESSION: {session_id}")
+    print(f"📝 QUERY: {query}")
     if blacklist:
-        print(f"BLACKLISTED DOMAINS: {', '.join(blacklist)}")
+        print(f"🚫 BLACKLISTED DOMAINS: {', '.join(blacklist)}")
     print(f"{'=' * 80}\n")
 
     start_time = time.time()
@@ -904,52 +976,98 @@ def run_search_agent(query: str, blacklist=None):
         "verification_feedback": None,
         "confidence_score": None,
         "attempts": 0,
-        "max_attempts": 3,
+        "max_attempts": 3,  # Will be updated by query_assessment
         "final_answer": None,
         "sources": [],
         "messages": []
     }
 
-    result = compiled_search_graph.invoke(initial_state)
+    # Configure logging level based on debug mode
+    if debug_mode:
+        logger.setLevel(logging.DEBUG)
+        log_step("SYSTEM", "Debug mode enabled - showing detailed execution logs")
+    else:
+        logger.setLevel(logging.INFO)
 
-    # Post-execution summary
-    execution_time = time.time() - start_time
-    confidence = result.get('confidence_score', 0.0)
+    try:
+        log_step("SYSTEM", f"Starting search process for: '{query}'")
+        result = compiled_search_graph.invoke(initial_state)
 
-    print(f"\n{'=' * 80}")
-    print(f"SEARCH SUMMARY:")
-    print(f"{'=' * 80}")
-    print(f"Query: {query}")
-    print(f"Query type: {result['query_type']}")
-    print(f"Total iterations: {result['attempts']}")
-    print(f"Confidence score: {confidence:.2f} ({get_confidence_level(confidence)})")
-    print(f"Execution time: {execution_time:.2f} seconds")
+        # Post-execution summary
+        execution_time = time.time() - start_time
+        confidence = result.get('confidence_score', 0.0)
 
-    # Count filtered sites
-    filtered_count = 0
-    for search_result in result.get("search_results", []):
-        if "filtered_sites" in search_result:
-            filtered_count += len(search_result["filtered_sites"])
+        # Format confidence indicator with visual cue
+        confidence_indicator = ""
+        if confidence >= 0.8:
+            confidence_indicator = "🟢 High confidence"
+        elif confidence >= 0.4:
+            confidence_indicator = "🟡 Medium confidence"
+        else:
+            confidence_indicator = "🔴 Low confidence"
 
-    if filtered_count > 0:
-        print(f"Blacklisted sites filtered: {filtered_count}")
+        print(f"\n{'=' * 80}")
+        print(f"📊 SEARCH SUMMARY:")
+        print(f"{'=' * 80}")
+        print(f"Session ID: {session_id}")
+        print(f"Query: {query}")
+        print(f"Strategy: {result['query_type']}")
+        print(f"Iterations: {result['attempts']} of {result.get('max_attempts', 3)} maximum")
+        print(f"Confidence: {confidence:.2f} ({confidence_indicator})")
+        print(f"Execution time: {execution_time:.2f} seconds")
 
-    # Count and display unique sites searched
-    all_sites = set()
-    for source in result.get("sources", []):
-        if "url" in source:
-            all_sites.add(source["url"])
+        # Count filtered sites
+        filtered_count = 0
+        for search_result in result.get("search_results", []):
+            if "filtered_sites" in search_result:
+                filtered_count += len(search_result["filtered_sites"])
 
-    if all_sites:
-        print(f"\nSites searched ({len(all_sites)}):")
-        for site in sorted(all_sites):
-            print(f"  - {site}")
+        if filtered_count > 0:
+            print(f"Blacklisted sites filtered: {filtered_count}")
 
-    print(f"\n{'=' * 80}")
-    print("FINAL ANSWER:")
-    print(f"{'=' * 80}")
+        # Get top sources by relevance
+        all_sites = set()
+        top_sources = []
 
-    return result["final_answer"]
+        if result.get("sources"):
+            # Sort sources by position (relevance)
+            sorted_sources = sorted(result.get("sources", []), key=lambda x: x.get("position", 999))
+
+            # Get unique sites
+            for source in sorted_sources:
+                if "url" in source:
+                    all_sites.add(source["url"])
+
+                    # Collect top 5 sources with titles
+                    if len(top_sources) < 5 and source.get("title"):
+                        if source["url"] not in [s["url"] for s in top_sources]:
+                            top_sources.append({
+                                "title": source.get("title", "Unknown"),
+                                "url": source["url"]
+                            })
+
+        if all_sites:
+            print(f"\nSources: {len(all_sites)} unique sites consulted")
+            if top_sources and debug_mode:
+                print("Top sources:")
+                for i, source in enumerate(top_sources, 1):
+                    print(f"  {i}. {source['title']}")
+                    print(f"     {source['url']}")
+
+        print(f"\n{'=' * 80}")
+        print(f"💡 ANSWER ({confidence_indicator}):")
+        print(f"{'=' * 80}")
+
+        return result["final_answer"]
+
+    except Exception as e:
+        log_step("ERROR", f"Search process failed: {str(e)}")
+        print(f"\n{'=' * 80}")
+        print(f"❌ ERROR: Search process failed")
+        print(f"{'=' * 80}")
+        print(f"An error occurred during the search process: {str(e)}")
+        print(f"Please try again with a different query or check the logs for details.")
+        return f"Search failed: {str(e)}"
 
 def get_confidence_level(score):
     """Return a human-readable confidence level based on the score."""
@@ -960,27 +1078,56 @@ def get_confidence_level(score):
     else:
         return "Low confidence"
 
-# Example usage
-if __name__ == "__main__":
-    queries = [
-        "What is the theory of relativity?",
-        "Who won the Super Bowl in 2024?",
-        "What are the current global approaches to quantum computing research?"
+# Main functionality
+def main():
+    """CLI interface for the search agent"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LangGraph Search Agent")
+    parser.add_argument("query", nargs="?", help="The search query")
+    parser.add_argument("--blacklist", "-b", help="Comma-separated list of domains to blacklist", default="")
+    parser.add_argument("--debug", "-d", action="store_true", help="Enable debug mode")
+    parser.add_argument("--demo", action="store_true", help="Run demo queries")
+
+    args = parser.parse_args()
+
+    if args.demo:
+        run_demo(debug_mode=args.debug)
+    elif args.query:
+        blacklist = [domain.strip() for domain in args.blacklist.split(",")] if args.blacklist else None
+        answer = run_search_agent(args.query, blacklist, debug_mode=args.debug)
+        print(f"\n{answer}")
+    else:
+        parser.print_help()
+
+def run_demo(debug_mode=False):
+    """Run a demonstration of the search agent with sample queries"""
+    print("\n" + "=" * 80)
+    print("🚀 LANGGRAPH SEARCH AGENT DEMONSTRATION")
+    print("=" * 80)
+    print("\nThis demonstration will run the following types of queries:")
+    print("1. Direct knowledge query (answered from LLM knowledge)")
+    print("2. Simple search query (requires verification of current information)")
+    print("3. Deep research query (requires multiple searches and synthesis)")
+    print("4. Query with domain blacklisting (filters certain sites)\n")
+
+    demo_queries = [
+        ("What is the theory of relativity?", None, "DIRECT KNOWLEDGE QUERY"),
+        ("Who won the Super Bowl in 2024?", None, "SIMPLE SEARCH QUERY"),
+        ("What are the current global approaches to quantum computing research?", None, "DEEP RESEARCH QUERY"),
+        ("What are popular coding tutorials for beginners?", ["youtube.com"], "BLACKLISTED DOMAIN QUERY")
     ]
 
-    # Example with no blacklist
-    for query in queries:
-        print(f"\n\nQuery: {query}")
-        print("-" * 50)
-        answer = run_search_agent(query)
-        print(f"Answer: {answer}")
+    for query, blacklist, description in demo_queries:
+        print("\n" + "=" * 80)
+        print(f"📌 DEMO: {description}")
         print("=" * 80)
+        start = time.time()
+        answer = run_search_agent(query, blacklist, debug_mode=debug_mode)
+        end = time.time()
+        print(f"\nSearch completed in {end - start:.2f} seconds\n")
+        print("-" * 80)
 
-    # Example with YouTube blacklisted
-    print("\n\nDEMONSTRATION OF BLACKLISTING:")
-    print("-" * 50)
-    query = "What are popular coding tutorials for beginners?"
-    blacklist = ["youtube.com", "tiktok.com"]
-    answer = run_search_agent(query, blacklist)
-    print(f"Answer: {answer}")
-    print("=" * 80)
+# Example usage
+if __name__ == "__main__":
+    main()
