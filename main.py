@@ -8,6 +8,7 @@ import time
 import os
 import logging
 import json
+import re
 from datetime import datetime
 
 # Set up logging
@@ -51,11 +52,15 @@ class SearchState(TypedDict):
     # Processing status
     verification_status: Optional[bool]
     verification_feedback: Optional[str]
+    confidence_score: Optional[float]  # Added confidence score
     attempts: int
     max_attempts: int
 
     # Response generation
     final_answer: Optional[str]
+
+    # Source tracking for attribution
+    sources: List[Dict]  # Added sources tracking
 
     # Conversation tracking
     messages: Annotated[List[Any], add_messages]
@@ -183,12 +188,22 @@ def execute_search(state: SearchState) -> Dict:
         # Execute search
         search_results = search_tool.results(latest_query)
 
-        # Extract searched sites for logging
+        # Extract searched sites for logging and source tracking
         sites = []
+        sources = state.get("sources", [])
+
         if isinstance(search_results, dict) and "organic" in search_results:
-            for result in search_results["organic"]:
+            for i, result in enumerate(search_results["organic"]):
                 if "link" in result:
+                    site_info = {
+                        "url": result["link"],
+                        "title": result.get("title", ""),
+                        "snippet": result.get("snippet", ""),
+                        "query": latest_query,
+                        "position": i + 1
+                    }
                     sites.append(result["link"])
+                    sources.append(site_info)
 
         log_step("EXECUTE_SEARCH", f"Search complete. Found {len(sites)} sites:", sites)
 
@@ -199,6 +214,7 @@ def execute_search(state: SearchState) -> Dict:
         # Return updates to state
         return {
             "search_results": all_results,
+            "sources": sources,
             "messages": [
                 {"role": "system", "content": f"Search executed for: {latest_query}"}
             ]
@@ -246,19 +262,29 @@ def execute_parallel_searches(state: SearchState) -> Dict:
     # Execute searches sequentially (instead of in parallel)
     search_results = []
     all_sites = []
+    sources = state.get("sources", [])
 
     for query in search_queries:
         log_step("DEEP_RESEARCH", f"Executing search for: '{query}'")
         try:
             results = search_tool.results(query)
 
-            # Extract searched sites for logging
+            # Extract searched sites for logging and source tracking
             sites = []
+
             if isinstance(results, dict) and "organic" in results:
-                for result in results["organic"]:
+                for i, result in enumerate(results["organic"]):
                     if "link" in result:
+                        site_info = {
+                            "url": result["link"],
+                            "title": result.get("title", ""),
+                            "snippet": result.get("snippet", ""),
+                            "query": query,
+                            "position": i + 1
+                        }
                         sites.append(result["link"])
                         all_sites.append(result["link"])
+                        sources.append(site_info)
 
             log_step("DEEP_RESEARCH", f"Search complete for '{query}'. Found {len(sites)} sites:", sites)
             search_results.append({"query": query, "results": results})
@@ -276,6 +302,7 @@ def execute_parallel_searches(state: SearchState) -> Dict:
     return {
         "search_queries": all_queries,
         "search_results": all_results,
+        "sources": sources,
         "messages": [
             {"role": "system", "content": "Executed parallel searches for deep research."},
             {"role": "user", "content": query_generation_prompt},
@@ -525,7 +552,7 @@ def evaluate_research_progress(state: SearchState) -> Dict:
     }
 
 def verification(state: SearchState) -> Dict:
-    """Verify the correctness and completeness of the final answer."""
+    """Verify the correctness and completeness of the final answer and assign a confidence score."""
     query = state["query"]
     final_answer = state["final_answer"]
     query_type = state["query_type"]
@@ -546,25 +573,56 @@ def verification(state: SearchState) -> Dict:
     - Relevance: Is it directly addressing what was asked?
     - Clarity: Is it clear and well-presented?
 
-    Respond with:
-    - VERIFIED: If the answer is satisfactory
-    - NEEDS_IMPROVEMENT: If the answer needs improvement, with specific feedback
+    Assign a confidence score from 0.0 to 1.0, where:
+    - 0.0-0.3: Low confidence (insufficient or potentially incorrect information)
+    - 0.4-0.7: Medium confidence (generally correct but may have gaps or uncertainties)
+    - 0.8-1.0: High confidence (comprehensive and accurate)
+
+    Respond in the following format:
+    SCORE: [confidence score between 0.0-1.0]
+    STATUS: [VERIFIED or NEEDS_IMPROVEMENT]
+    FEEDBACK: [your feedback on the answer, if any]
     """
 
     messages = [HumanMessage(content=prompt)]
     response = llm.invoke(messages)
 
-    # Check verification status
-    is_verified = "VERIFIED" in response.content
-    verification_feedback = None if is_verified else response.content
+    # Parse the response to extract confidence score and verification status
+    confidence_score = 0.0
+    is_verified = False
+    verification_feedback = None
 
-    log_step("VERIFICATION", f"Verification {'passed' if is_verified else 'failed'}",
+    # Extract confidence score
+    score_match = re.search(r'SCORE:\s*(0?\.\d+|[01])', response.content)
+    if score_match:
+        try:
+            confidence_score = float(score_match.group(1))
+        except ValueError:
+            confidence_score = 0.0
+
+    # Extract verification status
+    status_match = re.search(r'STATUS:\s*(VERIFIED|NEEDS_IMPROVEMENT)', response.content)
+    if status_match:
+        is_verified = status_match.group(1) == "VERIFIED"
+    else:
+        is_verified = "VERIFIED" in response.content
+
+    # Extract feedback
+    feedback_match = re.search(r'FEEDBACK:\s*(.*?)(?:\n|$)', response.content, re.DOTALL)
+    if feedback_match:
+        verification_feedback = feedback_match.group(1).strip()
+    elif not is_verified:
+        verification_feedback = response.content
+
+    log_step("VERIFICATION",
+             f"Verification {'passed' if is_verified else 'failed'} with confidence {confidence_score:.2f}",
              {"feedback": verification_feedback} if not is_verified else None)
 
     # Return updates to state
     return {
         "verification_status": is_verified,
         "verification_feedback": verification_feedback,
+        "confidence_score": confidence_score,
         "messages": [
             {"role": "system", "content": "Verifying answer."},
             {"role": "user", "content": prompt},
@@ -573,25 +631,32 @@ def verification(state: SearchState) -> Dict:
     }
 
 def summarize_answer(state: SearchState) -> Dict:
-    """Generate a final, polished answer based on the verified information."""
+    """Generate a final, polished answer based on the verified information with source attribution."""
     query = state["query"]
     final_answer = state["final_answer"]
     query_type = state["query_type"]
     verification_feedback = state.get("verification_feedback")
+    confidence_score = state.get("confidence_score", 0.0)
     attempts = state["attempts"]
+    sources = state.get("sources", [])
 
-    log_step("FINAL_ANSWER", f"Summarizing final answer after {attempts} iterations")
+    log_step("FINAL_ANSWER", f"Summarizing final answer after {attempts} iterations with confidence {confidence_score:.2f}")
 
-    # Extract sources for the summary
-    sources = []
-    for search_result in state.get("search_results", []):
-        if "results" in search_result and isinstance(search_result["results"], dict) and "organic" in search_result["results"]:
-            for result in search_result["results"]["organic"]:
-                if "link" in result:
-                    sources.append(result["link"])
-
+    # Extract top sources for attribution (limiting to 3-5 most relevant)
+    top_sources = []
     if sources:
-        log_step("FINAL_ANSWER", f"Sources used: {len(sources)}", sources)
+        # Sort sources by position (assuming lower position = higher relevance)
+        sorted_sources = sorted(sources, key=lambda x: x.get("position", 999))
+        # Take top 5 unique sources
+        unique_urls = set()
+        for source in sorted_sources:
+            if source["url"] not in unique_urls and len(top_sources) < 5:
+                top_sources.append(source)
+                unique_urls.add(source["url"])
+
+    if top_sources:
+        log_step("FINAL_ANSWER", f"Top sources for attribution: {len(top_sources)}",
+                 [f"{s.get('title', 'Untitled')} - {s['url']}" for s in top_sources])
 
     prompt = f"""
     Refine and summarize the final answer to: "{query}"
@@ -602,12 +667,20 @@ def summarize_answer(state: SearchState) -> Dict:
 
     {"Verification feedback: " + verification_feedback if verification_feedback else ""}
 
+    Confidence score: {confidence_score:.2f}
+
+    Sources to attribute (include these in your answer):
+    {json.dumps(top_sources, indent=2) if top_sources else "No specific sources to attribute."}
+
     Create a polished, comprehensive response that:
     - Directly addresses the query
     - Is well-structured and clear
     - Provides all relevant information
     - Maintains an appropriate level of detail
     - Uses a professional and helpful tone
+    - Includes appropriate source attribution at the end of the answer
+
+    If the confidence score is less than 0.7, acknowledge any limitations or uncertainties in the answer.
     """
 
     messages = [HumanMessage(content=prompt)]
@@ -752,9 +825,11 @@ def run_search_agent(query: str):
         "research_data": {},
         "verification_status": None,
         "verification_feedback": None,
+        "confidence_score": None,
         "attempts": 0,
         "max_attempts": 3,
         "final_answer": None,
+        "sources": [],
         "messages": []
     }
 
@@ -762,6 +837,7 @@ def run_search_agent(query: str):
 
     # Post-execution summary
     execution_time = time.time() - start_time
+    confidence = result.get('confidence_score', 0.0)
 
     print(f"\n{'=' * 80}")
     print(f"SEARCH SUMMARY:")
@@ -769,15 +845,14 @@ def run_search_agent(query: str):
     print(f"Query: {query}")
     print(f"Query type: {result['query_type']}")
     print(f"Total iterations: {result['attempts']}")
+    print(f"Confidence score: {confidence:.2f} ({get_confidence_level(confidence)})")
     print(f"Execution time: {execution_time:.2f} seconds")
 
     # Count and display unique sites searched
     all_sites = set()
-    for search_result in result.get("search_results", []):
-        if "results" in search_result and isinstance(search_result["results"], dict) and "organic" in search_result["results"]:
-            for res in search_result["results"]["organic"]:
-                if "link" in res:
-                    all_sites.add(res["link"])
+    for source in result.get("sources", []):
+        if "url" in source:
+            all_sites.add(source["url"])
 
     if all_sites:
         print(f"\nSites searched ({len(all_sites)}):")
@@ -789,6 +864,15 @@ def run_search_agent(query: str):
     print(f"{'=' * 80}")
 
     return result["final_answer"]
+
+def get_confidence_level(score):
+    """Return a human-readable confidence level based on the score."""
+    if score >= 0.8:
+        return "High confidence"
+    elif score >= 0.4:
+        return "Medium confidence"
+    else:
+        return "Low confidence"
 
 # Example usage
 if __name__ == "__main__":
