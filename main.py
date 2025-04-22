@@ -10,6 +10,7 @@ import logging
 import json
 import re
 from datetime import datetime
+from urllib.parse import urlparse
 
 # Set up logging
 logging.basicConfig(
@@ -36,6 +37,31 @@ def log_step(step_name, message, data=None):
     elif data:
         logger.info(f"  {data}")
 
+def is_blacklisted(url, blacklist):
+    """Check if a URL is from a blacklisted domain."""
+    if not blacklist:
+        return False
+
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc.lower()
+
+    # Handle www prefix and extract base domain
+    if domain.startswith('www.'):
+        domain = domain[4:]
+
+    # Check for exact domain match or subdomain match
+    for blacklisted_domain in blacklist:
+        blacklisted_domain = blacklisted_domain.lower()
+        # Remove www prefix if present
+        if blacklisted_domain.startswith('www.'):
+            blacklisted_domain = blacklisted_domain[4:]
+
+        # Check for exact match or if URL is a subdomain of blacklisted domain
+        if domain == blacklisted_domain or domain.endswith('.' + blacklisted_domain):
+            return True
+
+    return False
+
 # Define our state
 class SearchState(TypedDict):
     # Original query and assessment
@@ -45,6 +71,7 @@ class SearchState(TypedDict):
     # Search-related data
     search_results: List[Dict]
     search_queries: List[str]
+    blacklist: List[str]  # List of domains to blacklist
 
     # Research aggregation (for deep_research)
     research_data: Dict
@@ -181,8 +208,11 @@ def execute_search(state: SearchState) -> Dict:
     """Execute a search operation using the generated search query."""
     search_queries = state["search_queries"]
     latest_query = search_queries[-1]
+    blacklist = state.get("blacklist", [])
 
     log_step("EXECUTE_SEARCH", f"Searching for: '{latest_query}'")
+    if blacklist:
+        log_step("EXECUTE_SEARCH", f"Using domain blacklist: {blacklist}")
 
     try:
         # Execute search
@@ -190,22 +220,37 @@ def execute_search(state: SearchState) -> Dict:
 
         # Extract searched sites for logging and source tracking
         sites = []
+        filtered_sites = []
         sources = state.get("sources", [])
 
         if isinstance(search_results, dict) and "organic" in search_results:
+            # Filter out blacklisted domains and track what's filtered
+            filtered_results = []
             for i, result in enumerate(search_results["organic"]):
                 if "link" in result:
+                    url = result["link"]
+                    if is_blacklisted(url, blacklist):
+                        filtered_sites.append(url)
+                        continue
+
                     site_info = {
-                        "url": result["link"],
+                        "url": url,
                         "title": result.get("title", ""),
                         "snippet": result.get("snippet", ""),
                         "query": latest_query,
                         "position": i + 1
                     }
-                    sites.append(result["link"])
+                    sites.append(url)
                     sources.append(site_info)
+                    filtered_results.append(result)
 
-        log_step("EXECUTE_SEARCH", f"Search complete. Found {len(sites)} sites:", sites)
+            # Replace original results with filtered results
+            search_results["organic"] = filtered_results
+
+        if filtered_sites:
+            log_step("EXECUTE_SEARCH", f"Filtered {len(filtered_sites)} blacklisted sites:", filtered_sites)
+
+        log_step("EXECUTE_SEARCH", f"Search complete. Found {len(sites)} sites after filtering:", sites)
 
         # Add to existing results
         all_results = state.get("search_results", [])
@@ -235,8 +280,11 @@ def execute_search(state: SearchState) -> Dict:
 def execute_parallel_searches(state: SearchState) -> Dict:
     """Execute multiple searches in parallel for deep research."""
     query = state["query"]
+    blacklist = state.get("blacklist", [])
 
     log_step("DEEP_RESEARCH", f"Generating multiple search queries for deep research: '{query}'")
+    if blacklist:
+        log_step("DEEP_RESEARCH", f"Using domain blacklist: {blacklist}")
 
     # Generate multiple search queries for different aspects
     query_generation_prompt = f"""
@@ -262,6 +310,7 @@ def execute_parallel_searches(state: SearchState) -> Dict:
     # Execute searches sequentially (instead of in parallel)
     search_results = []
     all_sites = []
+    filtered_sites = []
     sources = state.get("sources", [])
 
     for query in search_queries:
@@ -271,28 +320,48 @@ def execute_parallel_searches(state: SearchState) -> Dict:
 
             # Extract searched sites for logging and source tracking
             sites = []
+            query_filtered_sites = []
 
             if isinstance(results, dict) and "organic" in results:
+                # Filter out blacklisted domains
+                filtered_results = []
                 for i, result in enumerate(results["organic"]):
                     if "link" in result:
+                        url = result["link"]
+                        if is_blacklisted(url, blacklist):
+                            query_filtered_sites.append(url)
+                            filtered_sites.append(url)
+                            continue
+
                         site_info = {
-                            "url": result["link"],
+                            "url": url,
                             "title": result.get("title", ""),
                             "snippet": result.get("snippet", ""),
                             "query": query,
                             "position": i + 1
                         }
-                        sites.append(result["link"])
-                        all_sites.append(result["link"])
+                        sites.append(url)
+                        all_sites.append(url)
                         sources.append(site_info)
+                        filtered_results.append(result)
 
-            log_step("DEEP_RESEARCH", f"Search complete for '{query}'. Found {len(sites)} sites:", sites)
+                # Replace original results with filtered results
+                results["organic"] = filtered_results
+
+            if query_filtered_sites:
+                log_step("DEEP_RESEARCH", f"Filtered {len(query_filtered_sites)} blacklisted sites for '{query}':",
+                         query_filtered_sites)
+
+            log_step("DEEP_RESEARCH", f"Search complete for '{query}'. Found {len(sites)} sites after filtering:", sites)
             search_results.append({"query": query, "results": results})
         except Exception as e:
             log_step("DEEP_RESEARCH", f"Search error for '{query}': {str(e)}")
             search_results.append({"query": query, "results": [], "error": str(e)})
 
-    log_step("DEEP_RESEARCH", f"All searches complete. Found {len(all_sites)} total sites.")
+    if filtered_sites:
+        log_step("DEEP_RESEARCH", f"Total of {len(filtered_sites)} blacklisted sites filtered across all searches")
+
+    log_step("DEEP_RESEARCH", f"All searches complete. Found {len(all_sites)} total sites after filtering.")
 
     # Add to existing results
     existing_results = state.get("search_results", [])
@@ -809,10 +878,17 @@ search_graph.add_edge("summarize_answer", END)
 compiled_search_graph = search_graph.compile()
 
 # Usage example
-def run_search_agent(query: str):
-    """Run the search agent with a given query."""
+def run_search_agent(query: str, blacklist=None):
+    """Run the search agent with a given query.
+
+    Args:
+        query (str): The search query to process
+        blacklist (list, optional): List of domains to exclude from search results
+    """
     print(f"\n{'=' * 80}")
     print(f"SEARCH QUERY: {query}")
+    if blacklist:
+        print(f"BLACKLISTED DOMAINS: {', '.join(blacklist)}")
     print(f"{'=' * 80}\n")
 
     start_time = time.time()
@@ -822,6 +898,7 @@ def run_search_agent(query: str):
         "query_type": None,
         "search_results": [],
         "search_queries": [],
+        "blacklist": blacklist or [],
         "research_data": {},
         "verification_status": None,
         "verification_feedback": None,
@@ -847,6 +924,15 @@ def run_search_agent(query: str):
     print(f"Total iterations: {result['attempts']}")
     print(f"Confidence score: {confidence:.2f} ({get_confidence_level(confidence)})")
     print(f"Execution time: {execution_time:.2f} seconds")
+
+    # Count filtered sites
+    filtered_count = 0
+    for search_result in result.get("search_results", []):
+        if "filtered_sites" in search_result:
+            filtered_count += len(search_result["filtered_sites"])
+
+    if filtered_count > 0:
+        print(f"Blacklisted sites filtered: {filtered_count}")
 
     # Count and display unique sites searched
     all_sites = set()
@@ -882,9 +968,19 @@ if __name__ == "__main__":
         "What are the current global approaches to quantum computing research?"
     ]
 
+    # Example with no blacklist
     for query in queries:
         print(f"\n\nQuery: {query}")
         print("-" * 50)
         answer = run_search_agent(query)
         print(f"Answer: {answer}")
         print("=" * 80)
+
+    # Example with YouTube blacklisted
+    print("\n\nDEMONSTRATION OF BLACKLISTING:")
+    print("-" * 50)
+    query = "What are popular coding tutorials for beginners?"
+    blacklist = ["youtube.com", "tiktok.com"]
+    answer = run_search_agent(query, blacklist)
+    print(f"Answer: {answer}")
+    print("=" * 80)
