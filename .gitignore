@@ -1,0 +1,97 @@
+###############################################################################
+#  Core Python artifacts
+###############################################################################
+# Compiled bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+dist/
+build/
+develop-eggs/
+eggs/
+*.egg-info/
+*.egg
+wheelhouse/
+*.whl
+pip-wheel-metadata/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+###############################################################################
+#  Virtual-environment directories
+###############################################################################
+.venv/
+venv/
+env/
+ENV/
+*.env/
+# Poetry
+.poetry/
+
+###############################################################################
+#  Testing, coverage, type-checking
+###############################################################################
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+
+###############################################################################
+#  Runtime & debug files
+###############################################################################
+*.log
+*.pid
+*.sqlite3
+*.db
+# dotenv / secrets
+.env
+.env.*
+
+###############################################################################
+#  IDE & editor settings
+###############################################################################
+# VS Code
+.vscode/
+# PyCharm / IntelliJ
+.idea/
+# Visual Studio
+.vs/
+# Eclipse / PyDev
+.project
+.pydevproject
+# Sublime Text
+*.sublime-*
+# Vim / Emacs
+*~
+.*.sw?
+.#*
+
+###############################################################################
+#  macOS, Windows & Linux cruft
+###############################################################################
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+Icon?
+
+# Data directory
+.tmp/

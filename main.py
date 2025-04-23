@@ -1,9 +1,19 @@
-from typing import TypedDict, List, Dict, Optional, Annotated, Any, Literal
+from typing import TypedDict, List, Dict, Optional, Annotated, Any, Literal, Type, Union
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_community.utilities import GoogleSerperAPIWrapper
+from langchain_community.utilities import (
+    GoogleSerperAPIWrapper,
+    BingSearchAPIWrapper,
+    BraveSearchWrapper,
+    DuckDuckGoSearchAPIWrapper,
+    MojeekSearchAPIWrapper,
+    SearxSearchWrapper,
+    YouSearchAPIWrapper
+)
+from langchain_community.utilities.jina_search import JinaSearchAPIWrapper
+from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
 import time
 import os
 import logging
@@ -11,6 +21,36 @@ import json
 import re
 from datetime import datetime
 from urllib.parse import urlparse
+from web_crawler import WebCrawler, enhance_search_results
+
+# Available search engines
+SEARCH_ENGINES = {
+    "google_serper": GoogleSerperAPIWrapper,
+    "bing": BingSearchAPIWrapper,
+    "brave": BraveSearchWrapper,
+    "duckduckgo": DuckDuckGoSearchAPIWrapper,
+    "jina": JinaSearchAPIWrapper,
+    "mojeek": MojeekSearchAPIWrapper,
+    "searx": SearxSearchWrapper,
+    "tavily": TavilySearchAPIWrapper,
+    "you": YouSearchAPIWrapper
+}
+
+# Environment variable prefix for search engine configuration
+ENV_PREFIX = "SEARCH_"
+
+# Directory for storing temp data
+TEMP_DIR = ".tmp"
+
+# Required API keys for each search engine
+REQUIRED_API_KEYS = {
+    "google_serper": ["SERPER_API_KEY"],
+    "bing": ["BING_SUBSCRIPTION_KEY"],
+    "brave": ["BRAVE_API_KEY"],
+    "tavily": ["TAVILY_API_KEY"],
+    "you": ["YOU_API_KEY"]
+    # Other engines may not require API keys or use different env vars
+}
 
 # Set up logging
 logging.basicConfig(
@@ -93,8 +133,74 @@ class SearchState(TypedDict):
     messages: Annotated[List[Any], add_messages]
 
 # Initialize LLM and search tool
-llm = ChatOpenAI(temperature=0.2)
-search_tool = GoogleSerperAPIWrapper()
+llm = ChatOpenAI(
+        temperature=0.2,
+        openai_api_base="http://192.168.0.172:8000/v1",
+        model="gemma-3-27b-it"
+    )
+
+# Configure and initialize search engine
+def init_search_engine(engine_name: str = "google_serper", **kwargs) -> Any:
+    """Initialize a search engine by name with optional configuration parameters.
+
+    Args:
+        engine_name: Name of the search engine to use (must be in SEARCH_ENGINES)
+        **kwargs: Configuration parameters to pass to the search engine constructor
+
+    Returns:
+        Initialized search engine instance
+
+    Raises:
+        ValueError: If engine_name is not recognized or required API keys are missing
+    """
+    if engine_name not in SEARCH_ENGINES:
+        available_engines = ", ".join(SEARCH_ENGINES.keys())
+        raise ValueError(f"Unknown search engine '{engine_name}'. Available engines: {available_engines}")
+
+    # Check for required API keys in environment variables
+    if engine_name in REQUIRED_API_KEYS:
+        for key_name in REQUIRED_API_KEYS[engine_name]:
+            if key_name not in os.environ and key_name not in kwargs:
+                raise ValueError(f"Missing required API key {key_name} for {engine_name}")
+
+    # Look for engine-specific configuration in environment variables
+    engine_env_prefix = f"{ENV_PREFIX}{engine_name.upper()}_"
+    for env_key, env_value in os.environ.items():
+        if env_key.startswith(engine_env_prefix):
+            # Convert environment variable to parameter name by removing prefix and converting to lowercase
+            param_name = env_key[len(engine_env_prefix):].lower()
+            if param_name not in kwargs:  # Don't override explicit parameters
+                kwargs[param_name] = env_value
+
+    # Handle common API key environment variables
+    if engine_name == "google_serper" and "api_key" not in kwargs and "SERPER_API_KEY" in os.environ:
+        kwargs["api_key"] = os.environ["SERPER_API_KEY"]
+    elif engine_name == "bing" and "subscription_key" not in kwargs and "BING_SUBSCRIPTION_KEY" in os.environ:
+        kwargs["subscription_key"] = os.environ["BING_SUBSCRIPTION_KEY"]
+    elif engine_name == "brave" and "api_key" not in kwargs and "BRAVE_API_KEY" in os.environ:
+        kwargs["api_key"] = os.environ["BRAVE_API_KEY"]
+    elif engine_name == "tavily" and "api_key" not in kwargs and "TAVILY_API_KEY" in os.environ:
+        kwargs["api_key"] = os.environ["TAVILY_API_KEY"]
+    elif engine_name == "you" and "api_key" not in kwargs and "YOU_API_KEY" in os.environ:
+        kwargs["api_key"] = os.environ["YOU_API_KEY"]
+    # Handle DuckDuckGo default parameters if not provided
+    elif engine_name == "duckduckgo" and "max_results" not in kwargs:
+        kwargs["max_results"] = int(os.environ.get(f"{engine_env_prefix}MAX_RESULTS", "10"))
+
+    # Initialize the engine
+    engine_class = SEARCH_ENGINES[engine_name]
+    log_step("SYSTEM", f"Initializing {engine_name} search engine")
+    return engine_class(**kwargs)
+
+# Default search tool (can be overridden when calling run_search_agent)
+search_tool = None  # Will be initialized on first use
+
+def get_search_tool(engine_name="google_serper", **kwargs):
+    """Get or initialize the search tool"""
+    global search_tool
+    if search_tool is None:
+        search_tool = init_search_engine(engine_name, **kwargs)
+    return search_tool
 
 # Define nodes
 def query_assessment(state: SearchState) -> Dict:
@@ -231,19 +337,153 @@ def generate_search_query(state: SearchState) -> Dict:
         ]
     }
 
+# Define a wrapper function to handle different search engines with varying interfaces
+def search_with_engine(search_tool, query, **kwargs):
+    """Execute search with the configured search engine, handling differences in interfaces.
+
+    Args:
+        search_tool: The initialized search engine
+        query: The search query
+        **kwargs: Additional parameters for the search
+
+    Returns:
+        Search results in a standardized format
+    """
+    # Get the engine name
+    engine_name = getattr(search_tool, "__class__", None)
+    engine_name = engine_name.__name__ if engine_name else "Unknown"
+
+    try:
+        # Handle engine-specific search methods
+        if "DuckDuckGoSearchAPIWrapper" in engine_name:
+            # DuckDuckGo needs max_results
+            max_results = kwargs.get("max_results", 10)
+            results = search_tool.results(query, max_results=max_results)
+        elif "TavilySearchAPIWrapper" in engine_name:
+            # Tavily has a specific format and may need additional parameters
+            results = search_tool.results(query,
+                                         max_results=kwargs.get("max_results", 10),
+                                         search_depth=kwargs.get("search_depth", "basic"))
+            # Standardize the output format to match other engines
+            if isinstance(results, list):
+                return {"organic": results}
+            return results
+        else:
+            # Default method for most engines
+            results = search_tool.results(query)
+
+        # Standardize results format
+        if not isinstance(results, dict):
+            results = {"results": results}
+
+        # If results has no "organic" key but has other data, add empty organic
+        if "organic" not in results and len(results) > 0:
+            results["organic"] = []
+
+        return results
+    except Exception as e:
+        log_step("SEARCH_ERROR", f"Error with {engine_name}: {str(e)}")
+        # Return standardized empty results
+        return {"organic": [], "error": str(e)}
+
+# Function to save data to JSON file
+def save_to_json(data, session_id, filename):
+    """Save data to a JSON file in the session's directory.
+
+    Args:
+        data: Data to save (dict or list)
+        session_id: Session ID for directory naming
+        filename: Name of the file to save
+
+    Returns:
+        Path to the saved file
+    """
+    # Create the session directory if it doesn't exist
+    session_dir = os.path.join(TEMP_DIR, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+
+    # Create the full file path
+    file_path = os.path.join(session_dir, filename)
+
+    # Save the data to JSON
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    log_step("STORAGE", f"Saved data to {file_path}")
+    return file_path
+
+# Function to load data from JSON file
+def load_from_json(session_id, filename):
+    """Load data from a JSON file in the session's directory.
+
+    Args:
+        session_id: Session ID for directory naming
+        filename: Name of the file to load
+
+    Returns:
+        Loaded data or None if file doesn't exist
+    """
+    file_path = os.path.join(TEMP_DIR, session_id, filename)
+
+    if not os.path.exists(file_path):
+        return None
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    log_step("STORAGE", f"Loaded data from {file_path}")
+    return data
+
 def execute_search(state: SearchState) -> Dict:
-    """Execute a search operation using the generated search query."""
+    """Execute a search operation using the generated search query and enhance with web crawling."""
     search_queries = state["search_queries"]
     latest_query = search_queries[-1]
     blacklist = state.get("blacklist", [])
+    enable_crawling = state.get("enable_crawling", True)
+    search_engine = state.get("search_engine", "google_serper")
+    session_id = state.get("session_id", f"search_{int(time.time())}")
 
     log_step("EXECUTE_SEARCH", f"Searching for: '{latest_query}'")
     if blacklist:
         log_step("EXECUTE_SEARCH", f"Using domain blacklist: {blacklist}")
 
     try:
-        # Execute search
-        search_results = search_tool.results(latest_query)
+        # Get the configured search tool
+        search_tool = get_search_tool()
+
+        # First, try with quotes for exact matching
+        quoted_query = latest_query
+        if not (quoted_query.startswith('"') and quoted_query.endswith('"')):
+            quoted_query = f'"{latest_query}"'
+
+        log_step("EXECUTE_SEARCH", f"Trying exact search with: {quoted_query}")
+        search_results = search_with_engine(search_tool, quoted_query, max_results=10)
+
+        # Save the exact search results
+        save_to_json(
+            search_results,
+            session_id,
+            f"search_exact_{len(search_queries)}.json"
+        )
+
+        organic_results_count = len(search_results.get("organic", []))
+        log_step("EXECUTE_SEARCH", f"Exact search returned {organic_results_count} results")
+
+        # If no results with quotes, retry without quotes
+        if organic_results_count == 0:
+            unquoted_query = latest_query.strip('"')
+            log_step("EXECUTE_SEARCH", f"No results with exact search, trying broader search: {unquoted_query}")
+            search_results = search_with_engine(search_tool, unquoted_query, max_results=10)
+
+            # Save the broader search results
+            save_to_json(
+                search_results,
+                session_id,
+                f"search_broad_{len(search_queries)}.json"
+            )
+
+            organic_results_count = len(search_results.get("organic", []))
+            log_step("EXECUTE_SEARCH", f"Broader search returned {organic_results_count} results")
 
         # Extract searched sites for logging and source tracking
         sites = []
@@ -279,9 +519,78 @@ def execute_search(state: SearchState) -> Dict:
 
         log_step("EXECUTE_SEARCH", f"Search complete. Found {len(sites)} sites after filtering:", sites)
 
+        # Initialize crawling data
+        crawled_data = {}
+
+        # Enhance results with web crawling if enabled and we have results
+        if enable_crawling and len(sites) > 0:
+            log_step("EXECUTE_SEARCH", "Enhancing search results with web crawling...")
+
+            original_query = state["query"]  # Use the original user query for relevance
+            enhanced_results = enhance_search_results(search_results, original_query)
+
+            # Save the enhanced results with crawled data
+            save_to_json(
+                enhanced_results,
+                session_id,
+                f"search_enhanced_{len(search_queries)}.json"
+            )
+
+            # Save raw crawled content for each domain
+            for domain_data in enhanced_results.get("crawled_results", []):
+                domain = domain_data.get("domain", "unknown")
+                domain_pages = domain_data.get("pages", [])
+
+                if domain_pages:
+                    save_to_json(
+                        domain_pages,
+                        session_id,
+                        f"crawled_{domain.replace('.', '_')}_{len(search_queries)}.json"
+                    )
+
+            # Log crawling results
+            crawled_domains = len(enhanced_results.get('crawled_results', []))
+            total_pages = enhanced_results.get('total_crawled_pages', 0)
+            log_step("EXECUTE_SEARCH", f"Crawling enhanced results with {total_pages} pages from {crawled_domains} domains")
+
+            # Update search results with enhanced data
+            search_results["enhanced"] = enhanced_results
+            crawled_data = enhanced_results
+
+            # Add crawled pages to sources
+            for domain_result in enhanced_results.get('crawled_results', []):
+                domain = domain_result.get('domain', '')
+                for page in domain_result.get('pages', []):
+                    url = page.get('url', '')
+                    metadata = page.get('metadata', {})
+
+                    if url and url not in [s["url"] for s in sources]:
+                        site_info = {
+                            "url": url,
+                            "title": metadata.get('title', f"Crawled page from {domain}"),
+                            "snippet": metadata.get('description', ''),
+                            "query": original_query,
+                            "position": 100,  # Lower position for crawled results
+                            "crawled": True
+                        }
+                        sources.append(site_info)
+
+            log_step("EXECUTE_SEARCH", f"Sources list updated with crawled pages. Now contains {len(sources)} sources")
+
+        # Save the final sources list
+        save_to_json(
+            sources,
+            session_id,
+            f"sources_{len(search_queries)}.json"
+        )
+
         # Add to existing results
         all_results = state.get("search_results", [])
-        all_results.append({"query": latest_query, "results": search_results})
+        all_results.append({
+            "query": latest_query,
+            "results": search_results,
+            "crawled_data": crawled_data
+        })
 
         # Return updates to state
         return {
@@ -295,10 +604,17 @@ def execute_search(state: SearchState) -> Dict:
         log_step("EXECUTE_SEARCH", f"Search error: {str(e)}")
 
         # Handle search errors
+        error_info = {"query": latest_query, "results": [], "error": str(e)}
+
+        # Save error information
+        save_to_json(
+            error_info,
+            session_id,
+            f"search_error_{len(search_queries)}.json"
+        )
+
         return {
-            "search_results": state.get("search_results", []) + [
-                {"query": latest_query, "results": [], "error": str(e)}
-            ],
+            "search_results": state.get("search_results", []) + [error_info],
             "messages": [
                 {"role": "system", "content": f"Search error: {str(e)}"}
             ]
@@ -308,31 +624,59 @@ def execute_parallel_searches(state: SearchState) -> Dict:
     """Execute multiple searches in parallel for deep research."""
     query = state["query"]
     blacklist = state.get("blacklist", [])
+    search_engine = state.get("search_engine", "google_serper")
+    session_id = state.get("session_id", f"search_{int(time.time())}")
 
     log_step("DEEP_RESEARCH", f"Generating multiple search queries for deep research: '{query}'")
     if blacklist:
         log_step("DEEP_RESEARCH", f"Using domain blacklist: {blacklist}")
 
-    # Generate multiple search queries for different aspects
+    # Generate multiple search queries for different aspects - we want 4 additional queries
+    # (plus the original query makes 5 total)
     query_generation_prompt = f"""
     For the deep research query: "{query}"
 
-    Generate 3 different search queries that would help gather comprehensive information.
+    Generate 4 different search queries that would help gather comprehensive information.
     Make each query focus on a different aspect or perspective of the topic.
-    Return only the 3 queries, one per line, no explanations.
+    The original query will also be used, so make these complementary and diverse.
+    Return only the 4 queries, one per line, no explanations.
     """
 
     messages = [HumanMessage(content=query_generation_prompt)]
     response = llm.invoke(messages)
 
     # Extract the search queries
-    search_queries = [q.strip() for q in response.content.strip().split('\n') if q.strip()]
+    additional_queries = [q.strip() for q in response.content.strip().split('\n') if q.strip()]
 
-    log_step("DEEP_RESEARCH", f"Generated {len(search_queries)} search queries:", search_queries)
+    # Ensure we have exactly 4 additional queries (pad if needed)
+    while len(additional_queries) < 4:
+        if len(additional_queries) < 1:
+            additional_queries.append(query)  # Just repeat the original query
+        else:
+            # Generate variations by adding qualifiers
+            additional_queries.append(f"{additional_queries[-1]} latest research")
+
+    # If somehow we got more than 4, trim the list
+    additional_queries = additional_queries[:4]
+
+    # Add the original query at the beginning
+    search_queries = [query] + additional_queries
+
+    # Save the generated queries
+    save_to_json(
+        {"original_query": query, "search_queries": search_queries},
+        session_id,
+        "deep_research_queries.json"
+    )
+
+    log_step("DEEP_RESEARCH", f"Using 5 search queries for deep research:", search_queries)
 
     # If we have existing queries, add them
     existing_queries = state.get("search_queries", [])
     all_queries = existing_queries + search_queries
+
+    # Get the configured search tool
+    search_tool = get_search_tool()
 
     # Execute searches sequentially (instead of in parallel)
     search_results = []
@@ -340,10 +684,17 @@ def execute_parallel_searches(state: SearchState) -> Dict:
     filtered_sites = []
     sources = state.get("sources", [])
 
-    for query in search_queries:
+    for i, query in enumerate(search_queries):
         log_step("DEEP_RESEARCH", f"Executing search for: '{query}'")
         try:
-            results = search_tool.results(query)
+            results = search_with_engine(search_tool, query, max_results=10)
+
+            # Save individual search results
+            save_to_json(
+                results,
+                session_id,
+                f"deep_search_{i+1}.json"
+            )
 
             # Extract searched sites for logging and source tracking
             sites = []
@@ -352,7 +703,7 @@ def execute_parallel_searches(state: SearchState) -> Dict:
             if isinstance(results, dict) and "organic" in results:
                 # Filter out blacklisted domains
                 filtered_results = []
-                for i, result in enumerate(results["organic"]):
+                for j, result in enumerate(results["organic"]):
                     if "link" in result:
                         url = result["link"]
                         if is_blacklisted(url, blacklist):
@@ -365,7 +716,7 @@ def execute_parallel_searches(state: SearchState) -> Dict:
                             "title": result.get("title", ""),
                             "snippet": result.get("snippet", ""),
                             "query": query,
-                            "position": i + 1
+                            "position": j + 1
                         }
                         sites.append(url)
                         all_sites.append(url)
@@ -380,10 +731,79 @@ def execute_parallel_searches(state: SearchState) -> Dict:
                          query_filtered_sites)
 
             log_step("DEEP_RESEARCH", f"Search complete for '{query}'. Found {len(sites)} sites after filtering:", sites)
+
+            # Enhance results with web crawling if enabled and we have results
+            if state.get("enable_crawling", True) and len(sites) > 0:
+                log_step("DEEP_RESEARCH", f"Enhancing results for '{query}' with web crawling...")
+
+                enhanced_results = enhance_search_results(results, query)
+
+                # Save the enhanced results with crawled data
+                save_to_json(
+                    enhanced_results,
+                    session_id,
+                    f"deep_enhanced_{i+1}.json"
+                )
+
+                # Save raw crawled content for each domain
+                for domain_data in enhanced_results.get("crawled_results", []):
+                    domain = domain_data.get("domain", "unknown")
+                    domain_pages = domain_data.get("pages", [])
+
+                    if domain_pages:
+                        save_to_json(
+                            domain_pages,
+                            session_id,
+                            f"deep_crawled_{domain.replace('.', '_')}_{i+1}.json"
+                        )
+
+                # Update results with enhanced data
+                results["enhanced"] = enhanced_results
+
+                # Add crawled pages to sources
+                for domain_result in enhanced_results.get('crawled_results', []):
+                    domain = domain_result.get('domain', '')
+                    for page in domain_result.get('pages', []):
+                        url = page.get('url', '')
+                        metadata = page.get('metadata', {})
+
+                        if url and url not in [s["url"] for s in sources]:
+                            site_info = {
+                                "url": url,
+                                "title": metadata.get('title', f"Crawled page from {domain}"),
+                                "snippet": metadata.get('description', ''),
+                                "query": query,
+                                "position": 100,  # Lower position for crawled results
+                                "crawled": True
+                            }
+                            sources.append(site_info)
+
             search_results.append({"query": query, "results": results})
         except Exception as e:
             log_step("DEEP_RESEARCH", f"Search error for '{query}': {str(e)}")
-            search_results.append({"query": query, "results": [], "error": str(e)})
+
+            # Save error information
+            error_info = {"query": query, "results": [], "error": str(e)}
+            save_to_json(
+                error_info,
+                session_id,
+                f"deep_search_error_{i+1}.json"
+            )
+
+            search_results.append(error_info)
+
+    # Save final sources and filtered sites
+    save_to_json(
+        sources,
+        session_id,
+        "deep_research_sources.json"
+    )
+
+    save_to_json(
+        {"filtered_sites": filtered_sites, "all_sites": all_sites},
+        session_id,
+        "deep_research_sites.json"
+    )
 
     if filtered_sites:
         log_step("DEEP_RESEARCH", f"Total of {len(filtered_sites)} blacklisted sites filtered across all searches")
@@ -483,12 +903,31 @@ def aggregate_research_data(state: SearchState) -> Dict:
 
     # Combine all search results for analysis
     all_results = []
+    crawled_content_by_domain = {}
+
     for result_set in search_results:
         if result_set.get("results"):
             all_results.append({
                 "query": result_set["query"],
                 "results": result_set["results"]
             })
+
+            # Extract crawled content if available
+            if "enhanced" in result_set.get("results", {}):
+                enhanced = result_set["results"]["enhanced"]
+                for domain_data in enhanced.get("crawled_results", []):
+                    domain = domain_data.get("domain", "unknown")
+
+                    if domain not in crawled_content_by_domain:
+                        crawled_content_by_domain[domain] = []
+
+                    for page in domain_data.get("pages", []):
+                        if page.get("content"):
+                            crawled_content_by_domain[domain].append({
+                                "url": page.get("url", ""),
+                                "title": page.get("metadata", {}).get("title", "Untitled"),
+                                "content": page.get("content", "")
+                            })
 
     if not all_results:
         return {
@@ -497,11 +936,31 @@ def aggregate_research_data(state: SearchState) -> Dict:
             ]
         }
 
+    # Prepare crawled content summary
+    crawled_content_summary = ""
+    if crawled_content_by_domain:
+        crawled_content_summary = "\nCrawled Content Summary:\n"
+        for domain, pages in crawled_content_by_domain.items():
+            crawled_content_summary += f"\nContent from {domain} ({len(pages)} pages):\n"
+
+            for i, page in enumerate(pages):
+                title = page.get("title", "Untitled")
+                url = page.get("url", "")
+
+                # Get a concise summary from the content
+                content = page.get("content", "")
+                content_summary = content[:300] + "..." if len(content) > 300 else content
+
+                crawled_content_summary += f"Page {i+1}: {title} - {url}\n"
+                crawled_content_summary += f"Content summary: {content_summary}\n\n"
+
     prompt = f"""
     Analyze these search results for the in-depth research query: "{query}"
 
     Search Results:
     {all_results}
+
+    {crawled_content_summary if crawled_content_by_domain else ""}
 
     Current Research Data:
     {existing_research}
@@ -945,13 +1404,17 @@ search_graph.add_edge("summarize_answer", END)
 compiled_search_graph = search_graph.compile()
 
 # Usage example
-def run_search_agent(query: str, blacklist=None, debug_mode=False):
+def run_search_agent(query: str, blacklist=None, debug_mode=False, enable_crawling=True,
+                     search_engine="google_serper", search_engine_kwargs=None):
     """Run the search agent with a given query.
 
     Args:
         query (str): The search query to process
         blacklist (list, optional): List of domains to exclude from search results
         debug_mode (bool, optional): Enable detailed debugging output
+        enable_crawling (bool, optional): Enable web crawling to enhance search results
+        search_engine (str, optional): Name of search engine to use (default: "google_serper")
+        search_engine_kwargs (dict, optional): Additional configuration for the search engine
     """
     # Create a session ID for tracking this search
     session_id = f"search_{int(time.time())}"
@@ -961,9 +1424,22 @@ def run_search_agent(query: str, blacklist=None, debug_mode=False):
     print(f"📝 QUERY: {query}")
     if blacklist:
         print(f"🚫 BLACKLISTED DOMAINS: {', '.join(blacklist)}")
+    if enable_crawling:
+        print(f"🌐 WEB CRAWLING: Enabled (1 level deep, max 5 pages per domain)")
+    print(f"🔎 SEARCH ENGINE: {search_engine}")
+    print(f"💾 DATA DIRECTORY: {os.path.join(TEMP_DIR, session_id)}")
     print(f"{'=' * 80}\n")
 
     start_time = time.time()
+
+    # Initialize the configured search engine
+    global search_tool
+    search_engine_kwargs = search_engine_kwargs or {}
+    search_tool = init_search_engine(search_engine, **search_engine_kwargs)
+
+    # Create the session directory
+    session_dir = os.path.join(TEMP_DIR, session_id)
+    os.makedirs(session_dir, exist_ok=True)
 
     initial_state = {
         "query": query,
@@ -979,8 +1455,18 @@ def run_search_agent(query: str, blacklist=None, debug_mode=False):
         "max_attempts": 3,  # Will be updated by query_assessment
         "final_answer": None,
         "sources": [],
+        "enable_crawling": enable_crawling,  # Add crawling flag to state
+        "search_engine": search_engine,      # Add search engine to state
+        "session_id": session_id,            # Add session ID to state
         "messages": []
     }
+
+    # Save initial state
+    save_to_json(
+        {k: v for k, v in initial_state.items() if k != "messages"},
+        session_id,
+        "initial_state.json"
+    )
 
     # Configure logging level based on debug mode
     if debug_mode:
@@ -992,6 +1478,13 @@ def run_search_agent(query: str, blacklist=None, debug_mode=False):
     try:
         log_step("SYSTEM", f"Starting search process for: '{query}'")
         result = compiled_search_graph.invoke(initial_state)
+
+        # Save final result
+        save_to_json(
+            {k: v for k, v in result.items() if k != "messages"},
+            session_id,
+            "final_result.json"
+        )
 
         # Post-execution summary
         execution_time = time.time() - start_time
@@ -1015,6 +1508,7 @@ def run_search_agent(query: str, blacklist=None, debug_mode=False):
         print(f"Iterations: {result['attempts']} of {result.get('max_attempts', 3)} maximum")
         print(f"Confidence: {confidence:.2f} ({confidence_indicator})")
         print(f"Execution time: {execution_time:.2f} seconds")
+        print(f"Data directory: {session_dir}")
 
         # Count filtered sites
         filtered_count = 0
@@ -1024,6 +1518,20 @@ def run_search_agent(query: str, blacklist=None, debug_mode=False):
 
         if filtered_count > 0:
             print(f"Blacklisted sites filtered: {filtered_count}")
+
+        # Count crawled pages
+        total_crawled = 0
+        crawled_domains = 0
+
+        if enable_crawling:
+            for search_result in result.get("search_results", []):
+                if "results" in search_result and "enhanced" in search_result["results"]:
+                    enhanced = search_result["results"]["enhanced"]
+                    total_crawled += enhanced.get("total_crawled_pages", 0)
+                    crawled_domains += len(enhanced.get("crawled_results", []))
+
+            if total_crawled > 0:
+                print(f"Web crawling: {total_crawled} pages from {crawled_domains} domains")
 
         # Get top sources by relevance
         all_sites = set()
@@ -1043,20 +1551,23 @@ def run_search_agent(query: str, blacklist=None, debug_mode=False):
                         if source["url"] not in [s["url"] for s in top_sources]:
                             top_sources.append({
                                 "title": source.get("title", "Unknown"),
-                                "url": source["url"]
+                                "url": source["url"],
+                                "crawled": source.get("crawled", False)
                             })
 
         if all_sites:
             print(f"\nSources: {len(all_sites)} unique sites consulted")
-            if top_sources and debug_mode:
+            if top_sources:
                 print("Top sources:")
                 for i, source in enumerate(top_sources, 1):
-                    print(f"  {i}. {source['title']}")
+                    crawled_indicator = " (crawled)" if source.get("crawled") else ""
+                    print(f"  {i}. {source['title']}{crawled_indicator}")
                     print(f"     {source['url']}")
 
         print(f"\n{'=' * 80}")
         print(f"💡 ANSWER ({confidence_indicator}):")
         print(f"{'=' * 80}")
+        print(f"\n{result['final_answer']}")
 
         return result["final_answer"]
 
@@ -1088,19 +1599,33 @@ def main():
     parser.add_argument("--blacklist", "-b", help="Comma-separated list of domains to blacklist", default="")
     parser.add_argument("--debug", "-d", action="store_true", help="Enable debug mode")
     parser.add_argument("--demo", action="store_true", help="Run demo queries")
+    parser.add_argument("--no-crawl", action="store_true", help="Disable web crawling")
+    parser.add_argument("--search-engine", "-s", help="Search engine to use",
+                       choices=list(SEARCH_ENGINES.keys()), default="google_serper")
+    parser.add_argument("--api-key", "-k", help="API key for the search engine (overrides environment variable)")
 
     args = parser.parse_args()
+    enable_crawling = not args.no_crawl
+
+    # Set up search engine kwargs
+    search_engine_kwargs = {}
+    if args.api_key:
+        search_engine_kwargs["api_key"] = args.api_key
 
     if args.demo:
-        run_demo(debug_mode=args.debug)
+        run_demo(debug_mode=args.debug, enable_crawling=enable_crawling,
+                search_engine=args.search_engine, search_engine_kwargs=search_engine_kwargs)
     elif args.query:
         blacklist = [domain.strip() for domain in args.blacklist.split(",")] if args.blacklist else None
-        answer = run_search_agent(args.query, blacklist, debug_mode=args.debug)
+        answer = run_search_agent(args.query, blacklist, debug_mode=args.debug,
+                                 enable_crawling=enable_crawling, search_engine=args.search_engine,
+                                 search_engine_kwargs=search_engine_kwargs)
         print(f"\n{answer}")
     else:
         parser.print_help()
 
-def run_demo(debug_mode=False):
+def run_demo(debug_mode=False, enable_crawling=True, search_engine="google_serper",
+            search_engine_kwargs=None):
     """Run a demonstration of the search agent with sample queries"""
     print("\n" + "=" * 80)
     print("🚀 LANGGRAPH SEARCH AGENT DEMONSTRATION")
@@ -1109,13 +1634,23 @@ def run_demo(debug_mode=False):
     print("1. Direct knowledge query (answered from LLM knowledge)")
     print("2. Simple search query (requires verification of current information)")
     print("3. Deep research query (requires multiple searches and synthesis)")
-    print("4. Query with domain blacklisting (filters certain sites)\n")
+    print("4. Query with domain blacklisting (filters certain sites)")
+    print(f"\n🔎 Using search engine: {search_engine}")
+    if enable_crawling:
+        print("\n🌐 Web crawling is ENABLED - results will be enhanced with content from related pages")
+    else:
+        print("\n🌐 Web crawling is DISABLED")
+    print()
 
     demo_queries = [
-        ("What is the theory of relativity?", None, "DIRECT KNOWLEDGE QUERY"),
-        ("Who won the Super Bowl in 2024?", None, "SIMPLE SEARCH QUERY"),
-        ("What are the current global approaches to quantum computing research?", None, "DEEP RESEARCH QUERY"),
-        ("What are popular coding tutorials for beginners?", ["youtube.com"], "BLACKLISTED DOMAIN QUERY")
+        ("What will the launch price be in Belgium for the nintendo switch 2?", None, "SIMPLE SEARCH QUERY"),
+
+        # ("What are the opening hours of Pisco y Nazca Ceviche Gastrobar in Washington DC?", None, "SIMPLE SEARCH QUERY"),
+        # ("What are the opening hours of Pisco y Nazca Ceviche Gastrobar in Washington DC?", None, "DEEP RESEARCH QUERY")
+        # ("What is the theory of relativity?", None, "DIRECT KNOWLEDGE QUERY"),
+        # ("Who won the Super Bowl in 2024?", None, "SIMPLE SEARCH QUERY"),
+        # ("What are the current global approaches to quantum computing research?", None, "DEEP RESEARCH QUERY"),
+        # ("What are popular coding tutorials for beginners?", ["youtube.com"], "BLACKLISTED DOMAIN QUERY")
     ]
 
     for query, blacklist, description in demo_queries:
@@ -1123,7 +1658,9 @@ def run_demo(debug_mode=False):
         print(f"📌 DEMO: {description}")
         print("=" * 80)
         start = time.time()
-        answer = run_search_agent(query, blacklist, debug_mode=debug_mode)
+        answer = run_search_agent(query, blacklist, debug_mode=debug_mode,
+                                 enable_crawling=enable_crawling, search_engine=search_engine,
+                                 search_engine_kwargs=search_engine_kwargs)
         end = time.time()
         print(f"\nSearch completed in {end - start:.2f} seconds\n")
         print("-" * 80)
